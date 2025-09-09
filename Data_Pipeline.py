@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""
+Data_Pipeline.py — minimal, leakage-safe starter
+
+Subcommands:
+  init                         -> create folders + default config
+  ingest-prices --csv FILE     -> load your prices CSV into parquet
+  ingest-macro  --csv FILE     -> load macro CSV into parquet (US10Y/US2Y/VIX)
+  build-calendar               -> derive trading days from prices
+  make-features                -> compute v1 features
+  make-labels                  -> compute next-day labels
+
+Expected CSV schemas you provide:
+  Prices CSV (wide or long is fine; here we expect LONG):
+    date,ticker,open,high,low,close,adj_close,volume
+  Macro CSV (daily or lower freq; will be forward-filled):
+    date,series,value        # series in {US10Y,US2Y,VIX}
+
+Usage examples (after `python Data_Pipeline.py init`):
+  python Data_Pipeline.py ingest-prices --csv data/raw/sample_prices.csv
+  python Data_Pipeline.py ingest-macro  --csv data/raw/sample_macro.csv
+  python Data_Pipeline.py build-calendar
+  python Data_Pipeline.py make-features
+  python Data_Pipeline.py make-labels
+"""
+
+import argparse
+import os
+from pathlib import Path
+import sys
+import json
+import pandas as pd
+import numpy as np
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
+
+# -------------------------
+# Paths & Config
+# -------------------------
+PROJ = Path(".")
+DATA = PROJ / "data"
+RAW = DATA / "raw"
+INTERIM = DATA / "interim"
+FEATURES = DATA / "features"
+REPORTS = PROJ / "reports"
+CONFIG = PROJ / "configs" / "default.json"
+
+DEFAULT_CFG = {
+    "decision_timing": "close",     # decide at close, enter next open
+    "entry_timing": "next_open",
+    "features": {
+        "momentum_windows": [5, 20],
+        "vol_window": 20,
+        "beta_window": 60,
+        "volume_zscore_window": 20,
+        "gap": True,
+        "high_low_range_window": 20,
+        "cross_sectional_ranks": True
+    },
+    "labels": {"horizon": "1d_open_to_close"},  # label uses t+1 open->close
+    "files": {
+        "prices_raw_parquet": str(RAW / "prices.parquet"),
+        "macro_raw_parquet": str(RAW / "macro.parquet"),
+        "calendar_csv": str(RAW / "trading_days.csv"),
+        "features_parquet": str(FEATURES / "eq_features.parquet"),
+        "labels_parquet": str(FEATURES / "labels.parquet")
+    }
+}
+
+def ensure_dirs():
+    for p in [DATA, RAW, INTERIM, FEATURES, REPORTS, PROJ / "configs"]:
+        p.mkdir(parents=True, exist_ok=True)
+
+def load_cfg():
+    if not CONFIG.exists():
+        raise FileNotFoundError("Run `init` first to create default config.")
+    with open(CONFIG, "r") as f:
+        return json.load(f)
+
+def save_cfg(cfg):
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+# -------------------------
+# Utilities
+# -------------------------
+def _assert_cols(df, req, name):
+    missing = [c for c in req if c not in df.columns]
+    if missing:
+        raise ValueError(f"{name} missing columns: {missing}")
+
+def _to_datetime(df, col="date"):
+    df[col] = pd.to_datetime(df[col], utc=False).dt.tz_localize(None)
+    return df
+
+def _sort(df):
+    if "ticker" in df.columns:
+        return df.sort_values(["ticker", "date"])
+    return df.sort_values("date")
+
+# -------------------------
+# Commands
+# -------------------------
+def cmd_init(_args):
+    ensure_dirs()
+    if not CONFIG.exists():
+        save_cfg(DEFAULT_CFG)
+    # Put tiny readme placeholders
+    (RAW / "README.txt").write_text("Place raw CSVs here (prices, macro) or use CLI to ingest.\n")
+    print(f"✅ Project initialized.\n - Folders under ./data\n - Default config at {CONFIG}")
+
+def cmd_ingest_prices(args):
+    cfg = load_cfg()
+    ensure_dirs()
+    csv_path = Path(args.csv)
+    if not csv_path.exists():
+        raise FileNotFoundError(csv_path)
+
+    df = pd.read_csv(csv_path)
+    req = ["date","ticker","open","high","low","close","adj_close","volume"]
+    _assert_cols(df, req, "prices CSV")
+    df = _to_datetime(df, "date")
+    df = _sort(df).reset_index(drop=True)
+    # Basic cleaning
+    df = df.dropna(subset=["date","ticker","adj_close"]).copy()
+    df["ticker"] = df["ticker"].astype(str).str.upper()
+    # Save to parquet
+    out = Path(cfg["files"]["prices_raw_parquet"])
+    df.to_parquet(out, index=False)
+    print(f"✅ Ingested prices → {out} ({len(df):,} rows, {df['ticker'].nunique()} tickers)")
+
+def cmd_ingest_macro(args):
+    cfg = load_cfg()
+    ensure_dirs()
+    csv_path = Path(args.csv)
+    if not csv_path.exists():
+        raise FileNotFoundError(csv_path)
+    df = pd.read_csv(csv_path)
+    req = ["date","series","value"]
+    _assert_cols(df, req, "macro CSV")
+    df = _to_datetime(df, "date")
+    df["series"] = df["series"].astype(str).str.upper()
+    df = df.dropna(subset=["date","series","value"]).copy()
+    df = _sort(df)
+    out = Path(cfg["files"]["macro_raw_parquet"])
+    df.to_parquet(out, index=False)
+    print(f"✅ Ingested macro → {out} ({len(df):,} rows, {df['series'].nunique()} series)")
+
+def cmd_build_calendar(_args):
+    cfg = load_cfg()
+    prices = pd.read_parquet(cfg["files"]["prices_raw_parquet"])
+    prices = _sort(prices)
+    trading_days = (
+        prices[["date"]].drop_duplicates().sort_values("date")
+    )
+    out = Path(cfg["files"]["calendar_csv"])
+    trading_days.to_csv(out, index=False)
+    print(f"✅ Built trading calendar → {out} ({len(trading_days):,} days)")
+
+def _forward_fill_macro_to_daily(macro_df, calendar_df):
+    # Pivot to wide: date x series
+    wide = macro_df.pivot(index="date", columns="series", values="value").sort_index()
+    # Reindex to trading calendar and forward-fill
+    cal = calendar_df["date"].sort_values().unique()
+    wide = wide.reindex(cal).ffill()
+    wide = wide.reset_index()
+    return wide  # columns like US10Y, US2Y, VIX
+
+def _rolling_beta(stock_ret, mkt_ret, window):
+    """
+    Simple rolling beta via cov/var.
+    Returns series aligned to stock_ret index.
+    """
+    cov = stock_ret.rolling(window).cov(mkt_ret)
+    var = mkt_ret.rolling(window).var()
+    beta = cov / var
+    return beta
+
+def cmd_make_features(_args):
+    cfg = load_cfg()
+    f = cfg["files"]
+    prices = pd.read_parquet(f["prices_raw_parquet"])
+    prices = _sort(prices).reset_index(drop=True)
+
+    # Basic sanity
+    _assert_cols(prices, ["date","ticker","open","high","low","close","adj_close","volume"], "prices")
+
+    # Returns
+    prices["log_ret"] = np.log(prices.groupby("ticker")["adj_close"].pct_change() + 1.0)
+    prices["ret_1"] = prices.groupby("ticker")["adj_close"].pct_change()
+    # Momentum windows
+    w_moms = cfg["features"]["momentum_windows"]
+    for w in w_moms:
+        prices[f"mom_{w}"] = prices.groupby("ticker")["adj_close"].pct_change(periods=w)
+
+    # Volatility (annualized)
+    vol_w = cfg["features"]["vol_window"]
+    prices["vol_20"] = (
+        prices.groupby("ticker")["log_ret"]
+        .rolling(vol_w).std().reset_index(level=0, drop=True) * np.sqrt(252)
+    )
+
+    # Volume zscore
+    vz_w = cfg["features"]["volume_zscore_window"]
+    grp = prices.groupby("ticker")["volume"]
+    mean_v = grp.rolling(vz_w).mean().reset_index(level=0, drop=True)
+    std_v  = grp.rolling(vz_w).std().reset_index(level=0, drop=True)
+    prices["vol_z20"] = (prices["volume"] - mean_v) / std_v
+
+    # Gap & high-low range
+    prices["prev_close"] = prices.groupby("ticker")["adj_close"].shift(1)
+    prices["gap"] = (prices["open"] - prices["prev_close"]) / prices["prev_close"]
+    hl_w = cfg["features"]["high_low_range_window"]
+    prices["hl_range"] = (prices["high"] - prices["low"]) / prices["adj_close"]
+    prices["high_low_range20"] = (
+        prices.groupby("ticker")["hl_range"].rolling(hl_w).mean().reset_index(level=0, drop=True)
+    )
+
+    # Rolling beta & idiosyncratic vol vs a market proxy (use median of universe as proxy if SPY not present)
+    # Here we’ll use cross-sectional median return as a simple market proxy to avoid extra dependency.
+    # (You can switch to SPY later by merging SPY prices).
+    ret = prices[["date","ticker","log_ret"]].dropna()
+    # Market ret: cross-sectional median by date
+    mkt = ret.groupby("date")["log_ret"].median().rename("mkt_ret").reset_index()
+    tmp = ret.merge(mkt, on="date", how="left").dropna(subset=["log_ret","mkt_ret"])
+    beta_w = cfg["features"]["beta_window"]
+    tmp["beta_rolling"] = tmp.groupby("ticker", group_keys=False).apply(
+        lambda d: _rolling_beta(d["log_ret"], d["mkt_ret"], beta_w)
+    )
+    # Idiosyncratic volatility: std of residuals over the same window
+    tmp["resid"] = tmp["log_ret"] - tmp["beta_rolling"] * tmp["mkt_ret"]
+    tmp["idio_vol_60"] = tmp.groupby("ticker")["resid"].rolling(beta_w).std().reset_index(level=0, drop=True)
+
+    # Merge back
+    features = prices.merge(
+        tmp[["date","ticker","beta_rolling","idio_vol_60"]],
+        on=["date","ticker"], how="left"
+    )
+
+    # Cross-sectional ranks (per date)
+    if cfg["features"]["cross_sectional_ranks"]:
+        for col in [f"mom_{w}" for w in w_moms] + ["vol_20","idio_vol_60"]:
+            if col in features.columns:
+                features[f"rank_{col}_pct"] = (
+                    features.groupby("date")[col]
+                    .rank(pct=True, method="average")
+                )
+
+    # Macro: optional if provided
+    if Path(f["macro_raw_parquet"]).exists() and Path(f["calendar_csv"]).exists():
+        macro = pd.read_parquet(f["macro_raw_parquet"])
+        cal = pd.read_csv(f["calendar_csv"])
+        macro = _to_datetime(macro, "date")
+        cal = _to_datetime(cal, "date")
+        macro_wide = _forward_fill_macro_to_daily(macro, cal)
+        # Term spread
+        if {"US10Y","US2Y"}.issubset(macro_wide.columns):
+            macro_wide["TERM_SPREAD"] = macro_wide["US10Y"] - macro_wide["US2Y"]
+        # Merge to features
+        features = features.merge(macro_wide, on="date", how="left")
+
+    # Final select & drop warm-up NaNs
+    keep_cols = [
+        "date","ticker","ret_1",
+        *[f"mom_{w}" for w in w_moms],
+        "vol_20","vol_z20","gap","high_low_range20",
+        "beta_rolling","idio_vol_60",
+        *[c for c in features.columns if c.startswith("rank_mom_") or c.startswith("rank_vol_") or c.startswith("rank_idio_")],
+        # macro columns if present
+    ]
+    keep_cols = [c for c in keep_cols if c in features.columns]
+    out_df = features[keep_cols].dropna().sort_values(["ticker","date"]).reset_index(drop=True)
+
+    out_path = Path(f["features_parquet"])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_parquet(out_path, index=False)
+    print(f"✅ Features written → {out_path} ({len(out_df):,} rows)")
+
+def cmd_make_labels(_args):
+    cfg = load_cfg()
+    f = cfg["files"]
+    prices = pd.read_parquet(f["prices_raw_parquet"])
+    prices = _sort(prices)
+    # Decide at close (t), enter next open (t+1) → label is next-day open→close return
+    # y = (close_{t+1} - open_{t+1}) / open_{t+1}
+    prices["open_t1"]  = prices.groupby("ticker")["open"].shift(-1)
+    prices["close_t1"] = prices.groupby("ticker")["close"].shift(-1)
+    y = (prices["close_t1"] - prices["open_t1"]) / prices["open_t1"]
+    labels = prices[["date","ticker"]].copy()
+    labels["y_next_1d"] = y
+    labels["target_1d"] = (labels["y_next_1d"] > 0).astype(int)
+    labels = labels.dropna().sort_values(["ticker","date"]).reset_index(drop=True)
+    out = Path(f["labels_parquet"])
+    out.parent.mkdir(parents=True, exist_ok=True)
+    labels.to_parquet(out, index=False)
+    print(f"✅ Labels written → {out} ({len(labels):,} rows)")
+
+
+def _write_prices_parquet_from_df(df_long, out_path):
+    req = ["date","ticker","open","high","low","close","adj_close","volume"]
+    _assert_cols(df_long, req, "yfinance result")
+    df_long["ticker"] = df_long["ticker"].astype(str).str.upper()
+    _to_datetime(df_long, "date")
+    df_long = _sort(df_long).dropna(subset=["date","ticker","adj_close"])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df_long.to_parquet(out_path, index=False)
+
+
+def cmd_fetch_yfinance(args):
+    """
+    Fetch daily OHLCV via yfinance and save to the configured parquet:
+      prices_raw_parquet
+    Usage:
+      python Data_Pipeline.py fetch-yfinance --tickers AAPL MSFT SPY --start 2018-01-01 --end 2025-09-08
+    You can also supply --universe-file pointing to a CSV/TXT with one ticker per line or a 'ticker' column.
+    """
+    if yf is None:
+        raise RuntimeError("yfinance is not installed. Run: pip install yfinance")
+
+    cfg = load_cfg()
+    tickers = list(args.tickers or [])
+    if args.universe_file:
+        p = Path(args.universe_file)
+        if not p.exists():
+            raise FileNotFoundError(p)
+        if p.suffix.lower() in {".csv", ".tsv"}:
+            dfu = pd.read_csv(p)
+            if "ticker" in dfu.columns:
+                tickers.extend(dfu["ticker"].astype(str).tolist())
+            else:
+                # assume first column has tickers
+                tickers.extend(dfu.iloc[:,0].astype(str).tolist())
+        else:
+            # txt with one ticker per line
+            tickers.extend([line.strip() for line in p.read_text().splitlines() if line.strip()])
+
+    tickers = sorted(set([t.strip().upper() for t in tickers if t.strip()]))
+    if not tickers:
+        raise ValueError("No tickers provided. Use --tickers ... or --universe-file FILE")
+
+    start = args.start or "2018-01-01"
+    end = args.end or None  # yfinance will default to today if None
+
+    print(f"⏬ Fetching {len(tickers)} tickers from yfinance "
+          f"({tickers[:8]}{'...' if len(tickers)>8 else ''}) "
+          f"start={start} end={end}")
+
+    # yfinance supports batching with space-joined tickers
+    data = yf.download(" ".join(tickers), start=start, end=end, group_by="ticker", auto_adjust=False, progress=True)
+
+    # If a single ticker, yfinance returns a single-level columns DF
+    records = []
+    if len(tickers) == 1:
+        t = tickers[0]
+        dft = data.reset_index()
+        dft["ticker"] = t
+        dft = dft.rename(columns={
+            "Date": "date",
+            "Open": "open", "High": "high", "Low": "low",
+            "Close": "close", "Adj Close": "adj_close", "Volume": "volume"
+        })
+        records.append(dft)
+    else:
+        # MultiIndex columns: (field level 1) under each ticker
+        for t in tickers:
+            if t not in data.columns.get_level_values(0):
+                # Sometimes a ticker fails; skip it
+                continue
+            dft = data[t].reset_index()
+            dft["ticker"] = t
+            dft = dft.rename(columns={
+                "Date": "date",
+                "Open": "open", "High": "high", "Low": "low",
+                "Close": "close", "Adj Close": "adj_close", "Volume": "volume"
+            })
+            records.append(dft)
+
+    if not records:
+        raise RuntimeError("yfinance returned no data (check tickers and date range).")
+
+    long_df = pd.concat(records, ignore_index=True)
+    # Keep only required cols
+    long_df = long_df[["date","ticker","open","high","low","close","adj_close","volume"]]
+
+    out = Path(cfg["files"]["prices_raw_parquet"])
+    _write_prices_parquet_from_df(long_df, out)
+    print(f"✅ Saved prices → {out} ({len(long_df):,} rows, {long_df['ticker'].nunique()} tickers)")
+
+
+# -------------------------
+# CLI
+# -------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Data pipeline CLI")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p0 = sub.add_parser("init", help="Create folders + default config")
+
+    p1 = sub.add_parser("ingest-prices", help="Ingest prices CSV")
+    p1.add_argument("--csv", required=True)
+
+    p2 = sub.add_parser("ingest-macro", help="Ingest macro CSV")
+    p2.add_argument("--csv", required=True)
+
+    p3 = sub.add_parser("build-calendar", help="Build trading calendar from prices")
+
+    p4 = sub.add_parser("make-features", help="Compute v1 features")
+
+    p5 = sub.add_parser("make-labels", help="Compute next-day labels")
+
+    p_fetch = sub.add_parser("fetch-yfinance", help="Fetch OHLCV via yfinance into prices parquet")
+    p_fetch.add_argument("--tickers", nargs="*", help="List of tickers (e.g., AAPL MSFT SPY)")
+    p_fetch.add_argument("--universe-file", help="CSV/TXT file with tickers or a 'ticker' column")
+    p_fetch.add_argument("--start", help="YYYY-MM-DD (default 2018-01-01)")
+    p_fetch.add_argument("--end", help="YYYY-MM-DD (default today)")
+
+    args = parser.parse_args()
+
+    if args.cmd == "init":
+        cmd_init(args)
+    elif args.cmd == "ingest-prices":
+        cmd_ingest_prices(args)
+    elif args.cmd == "ingest-macro":
+        cmd_ingest_macro(args)
+    elif args.cmd == "build-calendar":
+        cmd_build_calendar(args)
+    elif args.cmd == "make-features":
+        cmd_make_features(args)
+    elif args.cmd == "make-labels":
+        cmd_make_labels(args)
+    elif args.cmd == "fetch-yfinance":
+        cmd_fetch_yfinance(args)
+
+    else:
+        parser.print_help()
+
+    
+
+
+if __name__ == "__main__":
+    pd.set_option("display.width", 200)
+    main()

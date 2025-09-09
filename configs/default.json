@@ -1,0 +1,26 @@
+{
+  "decision_timing": "close",
+  "entry_timing": "next_open",
+  "features": {
+    "momentum_windows": [
+      5,
+      20
+    ],
+    "vol_window": 20,
+    "beta_window": 60,
+    "volume_zscore_window": 20,
+    "gap": true,
+    "high_low_range_window": 20,
+    "cross_sectional_ranks": true
+  },
+  "labels": {
+    "horizon": "1d_open_to_close"
+  },
+  "files": {
+    "prices_raw_parquet": "data/raw/prices.parquet",
+    "macro_raw_parquet": "data/raw/macro.parquet",
+    "calendar_csv": "data/raw/trading_days.csv",
+    "features_parquet": "data/features/eq_features.parquet",
+    "labels_parquet": "data/features/labels.parquet"
+  }
+}
