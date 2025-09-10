@@ -134,10 +134,4 @@ else
 fi
 
 echo "==> Done."
-echo "Artifacts:"
-echo "  - data/raw/prices.parquet"
-echo "  - data/raw/trading_days.csv"
-echo "  - data/features/eq_features.parquet"
-echo "  - data/features/labels.parquet"
-echo "  - reports/wf_daily.csv (if backtest ran)"
-echo "  - reports/wf_yearly.csv (if backtest ran)"
+
