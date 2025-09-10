@@ -69,10 +69,13 @@ DEFAULT_CFG = {
     }
 }
 
+#Create the directories for file organization
 def ensure_dirs():
     for p in [DATA, RAW, INTERIM, FEATURES, REPORTS, PROJ / "configs"]:
         p.mkdir(parents=True, exist_ok=True)
 
+
+#If the file configuration did not work, have user initialize, else load the JSON
 def load_cfg():
     if not CONFIG.exists():
         raise FileNotFoundError("Run `init` first to create default config.")
@@ -87,15 +90,20 @@ def save_cfg(cfg):
 # -------------------------
 # Utilities
 # -------------------------
+
+#Ensure there are no columns missing from CSV
 def _assert_cols(df, req, name):
     missing = [c for c in req if c not in df.columns]
     if missing:
         raise ValueError(f"{name} missing columns: {missing}")
+    
 
+#Standardize the date given in CSVs
 def _to_datetime(df, col="date"):
     df[col] = pd.to_datetime(df[col], utc=False).dt.tz_localize(None)
     return df
 
+#Sort the information by date
 def _sort(df):
     if "ticker" in df.columns:
         return df.sort_values(["ticker", "date"])
@@ -112,6 +120,9 @@ def cmd_init(_args):
     (RAW / "README.txt").write_text("Place raw CSVs here (prices, macro) or use CLI to ingest.\n")
     print(f"✅ Project initialized.\n - Folders under ./data\n - Default config at {CONFIG}")
 
+
+#takes a CSV file,ensures that it exists and had all of the necessary columns. It then drops any rows that are missing values 
+#Finally it converts the CSV to a parquet which is more efficient than a CSV
 def cmd_ingest_prices(args):
     cfg = load_cfg()
     ensure_dirs()
@@ -132,6 +143,7 @@ def cmd_ingest_prices(args):
     df.to_parquet(out, index=False)
     print(f"✅ Ingested prices → {out} ({len(df):,} rows, {df['ticker'].nunique()} tickers)")
 
+#takes in a CSV of macroeconimoc factors and cleans it in a similar way to cmd_ingest_prices
 def cmd_ingest_macro(args):
     cfg = load_cfg()
     ensure_dirs()
@@ -149,6 +161,8 @@ def cmd_ingest_macro(args):
     df.to_parquet(out, index=False)
     print(f"✅ Ingested macro → {out} ({len(df):,} rows, {df['series'].nunique()} series)")
 
+
+#takes unique dates from stocks and uses them to figure out what days were trading days. 
 def cmd_build_calendar(_args):
     cfg = load_cfg()
     prices = pd.read_parquet(cfg["files"]["prices_raw_parquet"])
@@ -160,6 +174,8 @@ def cmd_build_calendar(_args):
     trading_days.to_csv(out, index=False)
     print(f"✅ Built trading calendar → {out} ({len(trading_days):,} days)")
 
+
+#fills in macro values from last known value to ensure there are no missing values caused by values not being updated day of
 def _forward_fill_macro_to_daily(macro_df, calendar_df):
     # Pivot to wide: date x series
     wide = macro_df.pivot(index="date", columns="series", values="value").sort_index()
@@ -169,6 +185,7 @@ def _forward_fill_macro_to_daily(macro_df, calendar_df):
     wide = wide.reset_index()
     return wide  # columns like US10Y, US2Y, VIX
 
+#calculates the beta value for each stock over a 60 day rolling window to measure the inherent risk of the stock
 def _rolling_beta(stock_ret, mkt_ret, window):
     """
     Simple rolling beta via cov/var.
@@ -179,6 +196,9 @@ def _rolling_beta(stock_ret, mkt_ret, window):
     beta = cov / var
     return beta
 
+#creates the features from the cleaned data that will then be put into the machine learning model. Ensures that it is leak proof by only using
+#data that is up to day t if we are on day t + 1. This ensures that we are not using data that would not have been known yet to train the model
+#on the past outcomes.
 def cmd_make_features(_args):
     cfg = load_cfg()
     f = cfg["files"]
@@ -279,6 +299,9 @@ def cmd_make_features(_args):
     out_df.to_parquet(out_path, index=False)
     print(f"✅ Features written → {out_path} ({len(out_df):,} rows)")
 
+
+#creates the data that the ML model will learn from. Calculates the trade outcomes for each day of each trade being made
+#then places this data into a parquet. 
 def cmd_make_labels(_args):
     cfg = load_cfg()
     f = cfg["files"]
@@ -297,6 +320,7 @@ def cmd_make_labels(_args):
     out.parent.mkdir(parents=True, exist_ok=True)
     labels.to_parquet(out, index=False)
     print(f"✅ Labels written → {out} ({len(labels):,} rows)")
+
 
 
 def _write_prices_parquet_from_df(df_long, out_path):
