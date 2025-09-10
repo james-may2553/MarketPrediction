@@ -6,7 +6,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, roc_auc_score, classification_report
 
-# -------- settings you can tweak ----------
+# -------- settings to can tweak ----------
 FEATURES_PATH = "data/features/eq_features.parquet"
 LABELS_PATH   = "data/features/labels.parquet"
 TEST_FRACTION = 0.20        # last 20% of DATES used for test

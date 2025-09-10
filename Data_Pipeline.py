@@ -116,7 +116,6 @@ def cmd_init(_args):
     ensure_dirs()
     if not CONFIG.exists():
         save_cfg(DEFAULT_CFG)
-    # Put tiny readme placeholders
     (RAW / "README.txt").write_text("Place raw CSVs here (prices, macro) or use CLI to ingest.\n")
     print(f"✅ Project initialized.\n - Folders under ./data\n - Default config at {CONFIG}")
 
