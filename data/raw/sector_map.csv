@@ -1,0 +1,168 @@
+ticker,sector
+# --- Information Technology ---
+AAPL,Information Technology
+MSFT,Information Technology
+NVDA,Information Technology
+AVGO,Information Technology
+AMD,Information Technology
+INTC,Information Technology
+QCOM,Information Technology
+TXN,Information Technology
+ADBE,Information Technology
+CRM,Information Technology
+ORCL,Information Technology
+CSCO,Information Technology
+NOW,Information Technology
+PANW,Information Technology
+SNOW,Information Technology
+MU,Information Technology
+LRCX,Information Technology
+AMAT,Information Technology
+KLAC,Information Technology
+SHOP,Information Technology
+
+# --- Communication Services ---
+GOOGL,Communication Services
+GOOG,Communication Services
+META,Communication Services
+NFLX,Communication Services
+DIS,Communication Services
+TMUS,Communication Services
+VZ,Communication Services
+T,Communication Services
+TTD,Communication Services
+EA,Communication Services
+
+# --- Consumer Discretionary ---
+AMZN,Consumer Discretionary
+TSLA,Consumer Discretionary
+HD,Consumer Discretionary
+MCD,Consumer Discretionary
+NKE,Consumer Discretionary
+LOW,Consumer Discretionary
+SBUX,Consumer Discretionary
+BKNG,Consumer Discretionary
+CMG,Consumer Discretionary
+RIVN,Consumer Discretionary
+RCL,Consumer Discretionary
+MAR,Consumer Discretionary
+
+# --- Consumer Staples ---
+WMT,Consumer Staples
+COST,Consumer Staples
+PEP,Consumer Staples
+KO,Consumer Staples
+PG,Consumer Staples
+PM,Consumer Staples
+MO,Consumer Staples
+MDLZ,Consumer Staples
+KR,Consumer Staples
+CL,Consumer Staples
+
+# --- Financials ---
+JPM,Financials
+BAC,Financials
+WFC,Financials
+GS,Financials
+MS,Financials
+AXP,Financials
+BLK,Financials
+SCHW,Financials
+C,Financials
+PYPL,Financials
+V,Financials
+MA,Financials
+ICE,Financials
+
+# --- Health Care ---
+UNH,Health Care
+PFE,Health Care
+MRK,Health Care
+ABBV,Health Care
+LLY,Health Care
+TMO,Health Care
+DHR,Health Care
+JNJ,Health Care
+BSX,Health Care
+GILD,Health Care
+ISRG,Health Care
+VRTX,Health Care
+
+# --- Industrials ---
+CAT,Industrials
+HON,Industrials
+UPS,Industrials
+RTX,Industrials
+BA,Industrials
+GE,Industrials
+DE,Industrials
+LMT,Industrials
+NOC,Industrials
+ETN,Industrials
+MMM,Industrials
+ADP,Industrials
+
+# --- Energy ---
+XOM,Energy
+CVX,Energy
+COP,Energy
+EOG,Energy
+SLB,Energy
+PSX,Energy
+MPC,Energy
+OXY,Energy
+HAL,Energy
+DVN,Energy
+
+# --- Materials ---
+LIN,Materials
+APD,Materials
+SHW,Materials
+ECL,Materials
+NEM,Materials
+FCX,Materials
+DD,Materials
+MLM,Materials
+VMC,Materials
+ALB,Materials
+
+# --- Utilities ---
+NEE,Utilities
+DUK,Utilities
+SO,Utilities
+AEP,Utilities
+EXC,Utilities
+SRE,Utilities
+XEL,Utilities
+PEG,Utilities
+ED,Utilities
+WEC,Utilities
+
+# --- Real Estate ---
+PLD,Real Estate
+AMT,Real Estate
+EQIX,Real Estate
+CCI,Real Estate
+SPG,Real Estate
+O,Real Estate
+WELL,Real Estate
+PSA,Real Estate
+DLR,Real Estate
+VTR,Real Estate
+
+# --- ETFs / Benchmarks ---
+SPY,ETF
+QQQ,ETF
+IWM,ETF
+DIA,ETF
+XLK,ETF
+XLF,ETF
+XLY,ETF
+XLC,ETF
+XLI,ETF
+XLE,ETF
+XLP,ETF
+XLV,ETF
+XLU,ETF
+XLB,ETF
+XLRE,ETF

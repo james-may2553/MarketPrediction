@@ -50,16 +50,24 @@ CONFIG = PROJ / "configs" / "default.json"
 DEFAULT_CFG = {
     "decision_timing": "close",     # decide at close, enter next open
     "entry_timing": "next_open",
+    "beta_market": "SPY",           # "SPY" or "median"
+    "sector_map_csv": "data/raw/sector_map.csv",  # optional CSV: ticker,sector
+    "macro_delta_windows": [1, 5],  # compute deltas over these day windows
+    "winsorize": {"p_low": 0.01, "p_high": 0.99}, # per-date winsor for select cols
+
     "features": {
         "momentum_windows": [5, 20],
         "vol_window": 20,
+        "extra_vol_windows": [5, 10],        # new: smaller realized vol windows
         "beta_window": 60,
         "volume_zscore_window": 20,
         "gap": True,
         "high_low_range_window": 20,
-        "cross_sectional_ranks": True
+        "cross_sectional_ranks": True,
+        "sector_ranks": True,                # new: within-sector ranks
+        "dollar_volume": True                # new: add dollar volume feature
     },
-    "labels": {"horizon": "1d_open_to_close"},  # label uses t+1 open->close
+    "labels": {"horizon": "1d_open_to_close"},
     "files": {
         "prices_raw_parquet": str(RAW / "prices.parquet"),
         "macro_raw_parquet": str(RAW / "macro.parquet"),
@@ -68,6 +76,7 @@ DEFAULT_CFG = {
         "labels_parquet": str(FEATURES / "labels.parquet")
     }
 }
+
 
 #Create the directories for file organization
 def ensure_dirs():
@@ -108,6 +117,36 @@ def _sort(df):
     if "ticker" in df.columns:
         return df.sort_values(["ticker", "date"])
     return df.sort_values("date")
+
+
+def _winsorize_series(s, p_low=0.01, p_high=0.99):
+    if s.isna().all():
+        return s
+    lo, hi = s.quantile(p_low), s.quantile(p_high)
+    return s.clip(lower=lo, upper=hi)
+
+def _winsorize_per_date(df, cols, p_low, p_high):
+    # Winsorize columns per date to reduce outliers without leaking future info
+    def _w(d):
+        for c in cols:
+            if c in d.columns:
+                d[c] = _winsorize_series(d[c], p_low, p_high)
+        return d
+    return df.groupby("date", group_keys=False).apply(_w)
+
+def _load_sector_map(path_str):
+    if not path_str:
+        return None
+    p = Path(path_str)
+    # Only proceed if it's an existing FILE (not a dir)
+    if not (p.exists() and p.is_file()):
+        return None
+    smap = pd.read_csv(p)
+    if not {"ticker","sector"}.issubset(smap.columns):
+        raise ValueError("sector_map_csv must have columns: ticker,sector")
+    smap["ticker"] = smap["ticker"].astype(str).str.upper()
+    return smap[["ticker","sector"]]
+
 
 # -------------------------
 # Commands
@@ -204,23 +243,32 @@ def cmd_make_features(_args):
     prices = pd.read_parquet(f["prices_raw_parquet"])
     prices = _sort(prices).reset_index(drop=True)
 
-    # Basic sanity
     _assert_cols(prices, ["date","ticker","open","high","low","close","adj_close","volume"], "prices")
 
     # Returns
     prices["log_ret"] = np.log(prices.groupby("ticker")["adj_close"].pct_change() + 1.0)
-    prices["ret_1"] = prices.groupby("ticker")["adj_close"].pct_change()
+    prices["ret_1"]   = prices.groupby("ticker")["adj_close"].pct_change()
+
     # Momentum windows
     w_moms = cfg["features"]["momentum_windows"]
     for w in w_moms:
         prices[f"mom_{w}"] = prices.groupby("ticker")["adj_close"].pct_change(periods=w)
 
-    # Volatility (annualized)
+    # Volatility (annualized) + extra short windows
     vol_w = cfg["features"]["vol_window"]
     prices["vol_20"] = (
         prices.groupby("ticker")["log_ret"]
-        .rolling(vol_w).std().reset_index(level=0, drop=True) * np.sqrt(252)
+              .rolling(vol_w).std().reset_index(level=0, drop=True) * np.sqrt(252)
     )
+    for vw in cfg["features"].get("extra_vol_windows", []):
+        prices[f"vol_{vw}"] = (
+            prices.groupby("ticker")["log_ret"]
+                  .rolling(vw).std().reset_index(level=0, drop=True) * np.sqrt(252)
+        )
+
+    # Dollar volume (liquidity)
+    if cfg["features"].get("dollar_volume", True):
+        prices["dollar_vol"] = prices["adj_close"] * prices["volume"]
 
     # Volume zscore
     vz_w = cfg["features"]["volume_zscore_window"]
@@ -238,58 +286,126 @@ def cmd_make_features(_args):
         prices.groupby("ticker")["hl_range"].rolling(hl_w).mean().reset_index(level=0, drop=True)
     )
 
-    # Rolling beta & idiosyncratic vol vs a market proxy (use median of universe as proxy if SPY not present)
-    # Here we’ll use cross-sectional median return as a simple market proxy to avoid extra dependency.
-    # (You can switch to SPY later by merging SPY prices).
+    # -------------------
+    # Market proxy & beta / idio vol
+    # -------------------
     ret = prices[["date","ticker","log_ret"]].dropna()
-    # Market ret: cross-sectional median by date
-    mkt = ret.groupby("date")["log_ret"].median().rename("mkt_ret").reset_index()
-    tmp = ret.merge(mkt, on="date", how="left").dropna(subset=["log_ret","mkt_ret"])
     beta_w = cfg["features"]["beta_window"]
-    tmp["beta_rolling"] = tmp.groupby("ticker", group_keys=False).apply(
-        lambda d: _rolling_beta(d["log_ret"], d["mkt_ret"], beta_w)
+    beta_market = cfg.get("beta_market", "SPY").upper()
+
+    if beta_market == "SPY":
+        # Use SPY as market; if not present, fallback to cross-sectional median
+        spy = prices.loc[prices["ticker"] == "SPY", ["date","log_ret"]].rename(columns={"log_ret":"mkt_ret"})
+        if len(spy):
+            tmp = ret.merge(spy, on="date", how="left").dropna(subset=["log_ret","mkt_ret"])
+        else:
+            mkt = ret.groupby("date")["log_ret"].median().rename("mkt_ret").reset_index()
+            tmp = ret.merge(mkt, on="date", how="left").dropna(subset=["log_ret","mkt_ret"])
+    else:
+        # Cross-sectional median return as market
+        mkt = ret.groupby("date")["log_ret"].median().rename("mkt_ret").reset_index()
+        tmp = ret.merge(mkt, on="date", how="left").dropna(subset=["log_ret","mkt_ret"])
+
+    # Ensure stable order for alignment
+    tmp = tmp.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    beta_series = (
+        tmp.groupby("ticker", group_keys=False)
+        .apply(lambda d: _rolling_beta(d["log_ret"], d["mkt_ret"], beta_w),
+                include_groups=False)
+        .reset_index(drop=True)
     )
-    # Idiosyncratic volatility: std of residuals over the same window
+
+    tmp["beta_rolling"] = beta_series.values
+
     tmp["resid"] = tmp["log_ret"] - tmp["beta_rolling"] * tmp["mkt_ret"]
     tmp["idio_vol_60"] = tmp.groupby("ticker")["resid"].rolling(beta_w).std().reset_index(level=0, drop=True)
 
-    # Merge back
     features = prices.merge(
         tmp[["date","ticker","beta_rolling","idio_vol_60"]],
         on=["date","ticker"], how="left"
     )
 
-    # Cross-sectional ranks (per date)
+    # -------------------
+    # Cross-sectional ranks (universe-wide)
+    # -------------------
     if cfg["features"]["cross_sectional_ranks"]:
-        for col in [f"mom_{w}" for w in w_moms] + ["vol_20","idio_vol_60"]:
+        rank_cols = [f"mom_{w}" for w in w_moms] + ["vol_20","idio_vol_60","vol_z20"]
+        rank_cols += [c for c in features.columns if c.startswith("vol_") and c not in {"vol_20"}]
+        if cfg["features"].get("dollar_volume", True):
+            rank_cols += ["dollar_vol"]
+        for col in rank_cols:
             if col in features.columns:
                 features[f"rank_{col}_pct"] = (
-                    features.groupby("date")[col]
-                    .rank(pct=True, method="average")
+                    features.groupby("date")[col].rank(pct=True, method="average")
                 )
 
-    # Macro: optional if provided
+    # -------------------
+    # Sector ranks (optional, requires sector_map.csv)
+    # -------------------
+    if cfg["features"].get("sector_ranks", True):
+        smap = _load_sector_map(cfg.get("sector_map_csv", ""))
+        if smap is not None:
+            features = features.merge(smap, on="ticker", how="left")
+            if "sector" in features.columns:
+                for col in [f"mom_{w}" for w in w_moms] + ["vol_20","idio_vol_60"]:
+                    if col in features.columns:
+                        features[f"rank_sector_{col}_pct"] = (
+                            features.groupby(["date","sector"])[col].rank(pct=True, method="average")
+                        )
+
+    # -------------------
+    # Macro merge (optional) + macro deltas
+    # -------------------
+    macro_cols_added = []
     if Path(f["macro_raw_parquet"]).exists() and Path(f["calendar_csv"]).exists():
         macro = pd.read_parquet(f["macro_raw_parquet"])
         cal = pd.read_csv(f["calendar_csv"])
         macro = _to_datetime(macro, "date")
         cal = _to_datetime(cal, "date")
         macro_wide = _forward_fill_macro_to_daily(macro, cal)
-        # Term spread
+        # Term spread if both present
         if {"US10Y","US2Y"}.issubset(macro_wide.columns):
             macro_wide["TERM_SPREAD"] = macro_wide["US10Y"] - macro_wide["US2Y"]
-        # Merge to features
+        # Macro deltas
+        delta_ws = cfg.get("macro_delta_windows", [1,5])
+        for c in [col for col in macro_wide.columns if col != "date"]:
+            for w in delta_ws:
+                macro_wide[f"{c}_chg_{w}d"] = macro_wide[c].pct_change(w)
+        macro_cols_added = [c for c in macro_wide.columns if c != "date"]
         features = features.merge(macro_wide, on="date", how="left")
 
-    # Final select & drop warm-up NaNs
+    # -------------------
+    # Winsorize selected columns per date (reduce outliers)
+    # -------------------
+    wz = cfg.get("winsorize", {"p_low": 0.01, "p_high": 0.99})
+    wlow, whigh = wz.get("p_low", 0.01), wz.get("p_high", 0.99)
+    to_winsor = []
+    to_winsor += [f"mom_{w}" for w in w_moms if f"mom_{w}" in features.columns]
+    to_winsor += [c for c in ["vol_20","idio_vol_60","gap","high_low_range20","vol_z20","dollar_vol"] if c in features.columns]
+    to_winsor += [c for c in features.columns if c.startswith("vol_") and c not in {"vol_20"}]
+    if to_winsor:
+        features = _winsorize_per_date(features, to_winsor, wlow, whigh)
+
+    # -------------------
+    # Final select & save
+    # -------------------
     keep_cols = [
         "date","ticker","ret_1",
         *[f"mom_{w}" for w in w_moms],
-        "vol_20","vol_z20","gap","high_low_range20",
+        "vol_20", *[f"vol_{vw}" for vw in cfg["features"].get("extra_vol_windows", []) if f"vol_{vw}" in features.columns],
+        "vol_z20","gap","high_low_range20",
         "beta_rolling","idio_vol_60",
-        *[c for c in features.columns if c.startswith("rank_mom_") or c.startswith("rank_vol_") or c.startswith("rank_idio_")],
-        # macro columns if present
     ]
+    if cfg["features"].get("dollar_volume", True) and "dollar_vol" in features.columns:
+        keep_cols.append("dollar_vol")
+
+    # ranks
+    keep_cols += [c for c in features.columns if c.startswith("rank_")]
+
+    # macro cols if present
+    keep_cols += [c for c in macro_cols_added if c in features.columns]
+
     keep_cols = [c for c in keep_cols if c in features.columns]
     out_df = features[keep_cols].dropna().sort_values(["ticker","date"]).reset_index(drop=True)
 
@@ -297,6 +413,7 @@ def cmd_make_features(_args):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_parquet(out_path, index=False)
     print(f"✅ Features written → {out_path} ({len(out_df):,} rows)")
+
 
 
 #creates the data that the ML model will learn from. Calculates the trade outcomes for each day of each trade being made
@@ -370,6 +487,12 @@ def cmd_fetch_yfinance(args):
     print(f"⏬ Fetching {len(tickers)} tickers from yfinance "
           f"({tickers[:8]}{'...' if len(tickers)>8 else ''}) "
           f"start={start} end={end}")
+    
+    # If config requests SPY as market, ensure it's included
+    cfg = load_cfg()   # (already loaded at top of function in your file)
+    if cfg.get("beta_market", "SPY").upper() == "SPY" and "SPY" not in tickers:
+        tickers.append("SPY")
+
 
     # yfinance supports batching with space-joined tickers
     data = yf.download(" ".join(tickers), start=start, end=end, group_by="ticker", auto_adjust=False, progress=True)

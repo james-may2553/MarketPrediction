@@ -5,125 +5,249 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
 
-# -----------------------
-# Configs (tweak freely)
-# -----------------------
+# =====================
+# Config (tweak freely)
+# =====================
 FEATURES_PATH = "data/features/eq_features.parquet"
 LABELS_PATH   = "data/features/labels.parquet"
+SECTOR_MAP_CSV = "data/raw/sector_map.csv"   # used for sector caps
 
 # Walk-forward settings
-WARMUP_DAYS   = 504     # ~2 years of trading days before first test date
-EMBARGO_DAYS  = 10      # remove last X days from train to avoid bleed into test
-THRESHOLD     = 0.50    # prob threshold for long/flat (try 0.55+ as a sanity check)
-MIN_STOCKS    = 5       # require at least N names per day to trade
+WARMUP_DAYS        = 504      # require ~2Y before first test
+TRAIN_WINDOW_DAYS  = 504      # rolling window length
+EMBARGO_DAYS       = 10       # bleed protection
+REBALANCE_EVERY    = 1        # refit every N days (weekly-ish)
 
-# Cost model
-COST_BPS      = 2.0     # per side, approximated via turnover (e.g., 2 bps)
-# -----------------------
+# Trading rules
+THRESHOLD          = 0.5     # higher -> fewer, higher conviction longs
+MIN_STOCKS         = 5        # skip day if too few candidates
+MAX_POSITIONS      = 80       # cap portfolio breadth
+SECTOR_CAP_PCT     = 0.35     # max fraction of names from any one sector
+VOL_SCALE_WEIGHTS  = False     # 1/(vol_20+eps) scaling of weights
+EXCLUDE_TICKERS    = {"SPY","QQQ","IWM","DIA","XLK","XLF","XLY","XLC","XLI","XLE","XLP","XLV","XLU","XLB","XLRE"}  # avoid ETFs
 
+# Cost model (simple)
+COST_BPS           = 2.0      # per day, approximate via turnover
+
+RANDOM_STATE       = 0
+
+# =====================
+# Metrics helpers
+# =====================
 def sharpe(returns, ann_factor=252):
-    r = np.asarray(returns)
+    r = np.asarray(returns, dtype=float)
     if r.size == 0: return np.nan
     mu, sigma = r.mean(), r.std()
     return np.sqrt(ann_factor) * (mu / sigma) if sigma > 0 else np.nan
 
 def max_drawdown(equity_curve):
-    ec = np.asarray(equity_curve)
+    ec = np.asarray(equity_curve, dtype=float)
     peaks = np.maximum.accumulate(ec)
     dd = (ec - peaks) / peaks
-    return dd.min()  # negative number
+    return dd.min() if len(dd) else np.nan
+
+# =====================
+# Data prep
+# =====================
+def load_sector_map(path):
+    p = Path(path)
+    if p.exists() and p.is_file():
+        smap = pd.read_csv(p)
+        if {"ticker","sector"}.issubset(smap.columns):
+            smap["ticker"] = smap["ticker"].astype(str).str.upper()
+            return smap[["ticker","sector"]]
+    return None
 
 def prepare_data():
     X = pd.read_parquet(FEATURES_PATH)
     y = pd.read_parquet(LABELS_PATH)
-    df = X.merge(y, on=["date", "ticker"], how="inner")
 
-    # Sort + index
-    df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+    # Merge features & labels
+    df = X.merge(y, on=["date","ticker"], how="inner")
+    df["date"] = pd.to_datetime(df["date"])
+    df["ticker"] = df["ticker"].astype(str).str.upper()
+    df = df.sort_values(["date","ticker"]).reset_index(drop=True)
 
-    # Feature columns (everything except keys + labels)
-    feats = [c for c in df.columns if c not in ["date", "ticker", "y_next_1d", "target_1d"]]
-    return df, feats
+    # Attach sector info (for caps) if available
+    smap = load_sector_map(SECTOR_MAP_CSV)
+    if smap is not None:
+        df = df.merge(smap, on="ticker", how="left")
+    else:
+        df["sector"] = "UNKNOWN"
 
+    # Exclude ETFs/benchmarks from trading universe (keep them in df in case used as features, but we won’t trade them)
+    df["is_excluded"] = df["ticker"].isin(EXCLUDE_TICKERS)
+
+    # Feature columns: all numeric except metadata/labels
+    meta = {"date","ticker","sector","is_excluded","y_next_1d","target_1d"}
+    numerics = df.select_dtypes(include=[np.number]).columns
+    feature_cols = [c for c in numerics if c not in {"y_next_1d","target_1d"}]
+
+    return df, feature_cols
+
+# =====================
+# Model
+# =====================
+def make_model():
+    return Pipeline([
+        ("scaler", StandardScaler(with_mean=True, with_std=True)),
+        ("lr", LogisticRegression(
+            solver="saga",
+            max_iter=500,
+            C=1.0,
+            n_jobs=-1,
+            random_state=RANDOM_STATE
+        ))
+    ])
+
+# =====================
+# Portfolio helpers
+# =====================
+def apply_sector_cap(candidates, sector_cap_pct=0.25, max_positions=50):
+    """
+    candidates: DataFrame with columns [ticker, sector, prob_up] (sorted by prob_up desc)
+    Returns the tickers that pass sector caps up to max_positions.
+    """
+    if candidates.empty:
+        return []
+
+    total_cap = max(1, max_positions)
+    per_sector_cap = max(1, int(np.floor(sector_cap_pct * total_cap)))
+
+    kept = []
+    sector_counts = {}
+
+    for _, row in candidates.iterrows():
+        sec = row.get("sector", "UNKNOWN")
+        if sector_counts.get(sec, 0) < per_sector_cap:
+            kept.append(row["ticker"])
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+            if len(kept) >= total_cap:
+                break
+    return kept
+
+def vol_scale_weights(df_sub):
+    """
+    df_sub: rows for selected tickers on a single day, must have vol_20 (or any vol column).
+    Return normalized weights (sum to 1).
+    """
+    eps = 1e-6
+    if "vol_20" not in df_sub.columns or df_sub["vol_20"].isna().all():
+        # fallback: equal weight
+        w = np.ones(len(df_sub), dtype=float)
+    else:
+        inv = 1.0 / (df_sub["vol_20"].fillna(df_sub["vol_20"].median()) + eps)
+        w = inv.to_numpy()
+    w = w / w.sum() if w.sum() > 0 else np.ones_like(w) / len(w)
+    return w
+
+# =====================
+# Walk-forward backtest
+# =====================
 def walk_forward_backtest(df, feature_cols):
     dates = pd.Index(sorted(df["date"].unique()))
     if len(dates) <= WARMUP_DAYS + 1:
         raise ValueError("Not enough history for the chosen WARMUP_DAYS.")
 
-    # Storage for daily portfolio results
     daily = []
-
-    # Model pipeline (fit fresh each step on training window ONLY)
-    def make_model():
-        return Pipeline([
-            ("scaler", StandardScaler(with_mean=True, with_std=True)),
-            ("lr", LogisticRegression(max_iter=2000, C=1.0, n_jobs=None, random_state=0))
-        ])
+    model = None
 
     for t_idx in range(WARMUP_DAYS + EMBARGO_DAYS, len(dates) - 1):
-        # Train window: up to (t_idx - EMBARGO_DAYS - 1)
-        train_end_idx = t_idx - EMBARGO_DAYS
-        train_dates = dates[:train_end_idx]          # strictly before embargo
-        test_date   = dates[t_idx]                   # decide at t
-        next_date   = dates[t_idx + 1]               # realize at t+1 (your label is y_next_1d)
+        # Train window indices
+        train_end_idx   = t_idx - EMBARGO_DAYS
+        train_start_idx = max(0, train_end_idx - TRAIN_WINDOW_DAYS)
+        train_dates = dates[train_start_idx:train_end_idx]
+        test_date   = dates[t_idx]
+        next_date   = dates[t_idx + 1]
 
         train_df = df[df["date"].isin(train_dates)]
-        test_df  = df[df["date"] == test_date]       # cross-section for a single day
+        test_df  = df[df["date"] == test_date]
 
-        if len(train_df) == 0 or len(test_df) < MIN_STOCKS:
+        if train_df.empty or test_df["ticker"].nunique() < MIN_STOCKS:
             continue
 
-        # Prepare X/y
+        # Train set
         X_train = train_df[feature_cols].astype(float).values
-        y_train = train_df["target_1d"].values
+        y_train = train_df["target_1d"].astype(int).values
 
-        X_test  = test_df[feature_cols].astype(float).values
+        # Refit only every N days (and always the first usable day)
+        need_refit = (model is None) or ((t_idx - (WARMUP_DAYS + EMBARGO_DAYS)) % REBALANCE_EVERY == 0)
+        if need_refit:
+            model = make_model()
+            model.fit(X_train, y_train)
 
-        
-        # Fit & predict
-        model = make_model()
-        model.fit(X_train, y_train)
-        proba  = model.predict_proba(X_test)[:, 1]   # P(up)
-        preds  = (proba >= THRESHOLD)                # boolean
-
-        # Build positions for decision day (equal-weight longs)
+        # Score today's cross-section
+        X_test = test_df[feature_cols].astype(float).values
+        proba  = model.predict_proba(X_test)[:, 1]
         test_df = test_df.copy()
         test_df["prob_up"] = proba
-        test_df["signal"]  = preds.astype(int)       # ensure 0/1
 
-        n_longs = int(test_df["signal"].sum())
-        trade_weight = 0.0 if n_longs < MIN_STOCKS else (1.0 / n_longs)
+        # Universe filter: threshold + exclude ETFs + min stocks
+        pool = test_df.loc[(test_df["prob_up"] >= THRESHOLD) & (~test_df["is_excluded"])].copy()
+        # Sort by conviction
+        pool = pool.sort_values("prob_up", ascending=False)
 
-        # Join next-day realized return (label lives on the decision row)
-        pnl_components = test_df[["ticker", "signal"]].merge(
-            df.loc[df["date"] == test_date, ["ticker", "y_next_1d"]],
+        if pool.empty:
+            # no trades
+            daily.append({
+                "test_date": test_date, "n_longs": 0,
+                "gross_ret": 0.0, "cost": 0.0, "net_ret": 0.0,
+                "turnover": 0.0, "hit_rate": np.nan, "accuracy": np.nan,
+                "signals": {}
+            })
+            continue
+
+        # Apply sector caps & max positions
+        keep_tickers = apply_sector_cap(
+            candidates=pool[["ticker","sector","prob_up"]],
+            sector_cap_pct=SECTOR_CAP_PCT,
+            max_positions=MAX_POSITIONS
+        )
+        pool = pool[pool["ticker"].isin(keep_tickers)]
+
+        n_longs = len(pool)
+        if n_longs < MIN_STOCKS:
+            daily.append({
+                "test_date": test_date, "n_longs": 0,
+                "gross_ret": 0.0, "cost": 0.0, "net_ret": 0.0,
+                "turnover": 0.0, "hit_rate": np.nan, "accuracy": np.nan,
+                "signals": {}
+            })
+            continue
+
+        # Weights
+        if VOL_SCALE_WEIGHTS:
+            w = vol_scale_weights(pool)  # sum to 1
+        else:
+            w = np.ones(n_longs, dtype=float) / n_longs
+        pool["weight"] = w
+
+        # Realize next-day returns (labels live on the decision row)
+        pnl = pool[["ticker","weight"]].merge(
+            df.loc[df["date"] == test_date, ["ticker","y_next_1d"]],
             on="ticker", how="left"
-        ).dropna(subset=["y_next_1d"])               # robustness: ensure labels present
+        ).dropna(subset=["y_next_1d"])
 
-        pnl_components["contrib"] = trade_weight * pnl_components["signal"] * pnl_components["y_next_1d"]
-        gross_ret = pnl_components["contrib"].sum()
+        pnl["contrib"] = pnl["weight"] * pnl["y_next_1d"]
+        gross_ret = pnl["contrib"].sum()
 
-        # --- turnover & costs ---
+        # --- Turnover & costs (compare today vs yesterday's signals) ---
         if len(daily) > 0 and daily[-1]["test_date"] == dates[t_idx - 1]:
-            prev_sig = daily[-1]["signals"]  # dict ticker->0/1
+            prev_sig = daily[-1]["signals"]  # dict: ticker -> weight
         else:
             prev_sig = {}
 
-        curr_sig = dict(zip(test_df["ticker"], test_df["signal"]))
+        curr_sig = dict(zip(pool["ticker"], pool["weight"]))
         universe = set(curr_sig.keys()) | set(prev_sig.keys())
-        changed = sum(1 for tk in universe if curr_sig.get(tk, 0) != prev_sig.get(tk, 0))
-        turnover = changed / max(1, len(universe))
+        # L1 weight change as a proxy for turnover
+        turnover = sum(abs(curr_sig.get(tk, 0.0) - prev_sig.get(tk, 0.0)) for tk in universe)
 
         cost = (COST_BPS / 10000.0) * turnover
         net_ret = gross_ret - cost
 
-        # --- accuracy / hit-rate on traded names (long/flat) ---
-        if pnl_components["signal"].sum() > 0:
-            hit_rate = (pnl_components.loc[pnl_components["signal"] == 1, "y_next_1d"] > 0).mean()
-        else:
-            hit_rate = np.nan
-        day_acc = hit_rate
-
+        # Hit-rate among traded names (positive y_next_1d)
+        hit_rate = (pnl["y_next_1d"] > 0).mean() if len(pnl) else np.nan
+        day_acc  = hit_rate
 
         daily.append({
             "test_date": test_date,
@@ -137,10 +261,10 @@ def walk_forward_backtest(df, feature_cols):
             "signals": curr_sig,  # keep for next day's turnover calc
         })
 
-    # Build results DataFrame
+    # Build results
     res = pd.DataFrame(daily)
     if res.empty:
-        raise RuntimeError("No backtest rows produced—check your WARMUP_DAYS/EMBARGO/threshold settings.")
+        raise RuntimeError("No backtest rows produced—tune WARMUP/EMBARGO/THRESHOLD/MAX_POSITIONS.")
 
     res = res.drop(columns=["signals"])
     res = res.sort_values("test_date").reset_index(drop=True)
@@ -159,7 +283,7 @@ def walk_forward_backtest(df, feature_cols):
         "median_hit_rate_%": 100 * res["hit_rate"].median(skipna=True),
     }
 
-    # Yearly breakdown (hit-rate & return)
+    # Yearly breakdown
     res["year"] = pd.DatetimeIndex(res["test_date"]).year
     by_year = res.groupby("year").agg(
         days=("net_ret", "size"),
@@ -171,6 +295,9 @@ def walk_forward_backtest(df, feature_cols):
 
     return res, metrics, by_year
 
+# =====================
+# Main
+# =====================
 if __name__ == "__main__":
     df, feature_cols = prepare_data()
     res, metrics, by_year = walk_forward_backtest(df, feature_cols)
@@ -182,10 +309,8 @@ if __name__ == "__main__":
     print("\n=== Yearly Breakdown ===")
     print(by_year.to_string(index=False))
 
-    # Optional: write results for plotting
-    out_dir = Path("reports")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    res[["test_date", "net_ret", "equity", "n_longs", "turnover", "hit_rate"]].to_csv(out_dir / "wf_daily.csv", index=False)
-    by_year.to_csv(out_dir / "wf_yearly.csv", index=False)
+    out_dir = Path("reports"); out_dir.mkdir(parents=True, exist_ok=True)
+    res[["test_date","net_ret","equity","n_longs","turnover","hit_rate"]].to_csv(out_dir/"wf_daily.csv", index=False)
+    by_year.to_csv(out_dir/"wf_yearly.csv", index=False)
     print("\nSaved daily results → reports/wf_daily.csv")
     print("Saved yearly results → reports/wf_yearly.csv")
