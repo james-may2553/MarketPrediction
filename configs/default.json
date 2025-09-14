@@ -16,11 +16,28 @@
   "labels": {
     "horizon": "1d_open_to_close"
   },
+  "fundamentals": {
+    "ffill_days": 95,               
+    "winsor_pct": 0.01,                
+    "zscore_windows": [60, 120, 252]   
+  },
+  "regimes": {
+    "vix_high_thresh": 25.0,
+    "vix_low_thresh": 15.0,
+    "term_spread_high": 1.0,
+    "term_spread_low": 0.0,
+    "spy_realized_vol_win": 21,
+    "breadth_lookbacks": [5, 20]
+  },
   "files": {
     "prices_raw_parquet": "data/raw/prices.parquet",
     "macro_raw_parquet": "data/raw/macro.parquet",
     "calendar_csv": "data/raw/trading_days.csv",
     "features_parquet": "data/features/eq_features.parquet",
-    "labels_parquet": "data/features/labels.parquet"
+    "labels_parquet": "data/features/labels.parquet",
+    "fundamentals_raw_parquet": "data/raw/fundamentals.parquet",
+    "fundamentals_daily_parquet": "data/features/fundamentals_daily.parquet",
+    "sentiment_raw_parquet": "data/raw/sentiment.parquet",
+    "regimes_parquet": "data/features/regimes.parquet"
   }
 }
